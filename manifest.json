@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "markbusking.process-monitor",
+  "name": "Process Monitor",
+  "version": "1.2.0",
+  "author": "markbusking",
+  "description": "RAM usage monitor with recursive per-process tree explorer and process killer (pkexec for root)",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "ProcessMonitor.qml"
+  },
+  "barWidget": {
+    "displayName": "Process Monitor",
+    "description": "RAM usage with real aggregated per-process tree memory and kill actions",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": [
+      {
+        "key": "refreshInterval",
+        "type": "number",
+        "label": "Refresh interval (ms)",
+        "description": "How often to refresh process data. Lower = more responsive, higher = less CPU.",
+        "defaultValue": 2000
+      },
+      {
+        "key": "topCount",
+        "type": "number",
+        "label": "Top processes to show",
+        "description": "Number of top memory-consuming processes to display in the panel.",
+        "defaultValue": 15
+      }
+    ]
+  }
+}
