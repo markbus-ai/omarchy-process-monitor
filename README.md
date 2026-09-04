@@ -55,6 +55,16 @@ omarchy bar remove markbusking.process-monitor
 omarchy plugin remove markbusking.process-monitor --yes
 ```
 
+## Security notes
+
+- The widget only **reads** `/proc` (own + system-wide RSS, command lines, usernames) to build the tree.
+- Killing is always user-initiated behind a confirmation dialog showing PID, owner and tree size.
+- Own processes: signaled directly. Other users' processes: `pkexec /usr/bin/kill` (system binary, polkit auth).
+- The privileged path never executes repository code as root — only `/usr/bin/kill` on a freshly listed PID set.
+- Unprivileged kills revalidate each PID's identity (`comm` + starttime) between listing and signaling, so recycled PIDs are skipped, never killed by mistake.
+- PID 0/1/2 (including `init`) can never be targeted, from UI or script.
+- All subprocesses use absolute binary paths (`/usr/bin/python3`, `/usr/bin/kill`, `/usr/bin/pkexec`) and carry a 12 s watchdog; outputs are size-bounded (top-N rows, capped children).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

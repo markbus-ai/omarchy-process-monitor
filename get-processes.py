@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
 Get real aggregated RAM usage per process tree.
 
@@ -37,6 +37,15 @@ def get_process_info(pid):
                     rss_pages = int(line.split()[1])  # in kB
                 elif line.startswith("Threads:"):
                     num_threads = int(line.split()[1])
+
+        # starttime (jiffies since boot): stable age/identity for grouping
+        starttime = "0"
+        try:
+            sfields = stat[1].split()
+            if len(sfields) > 19:
+                starttime = sfields[19]
+        except Exception:
+            pass
         
         # Read cmdline
         cmdline = ""
@@ -68,7 +77,8 @@ def get_process_info(pid):
             "rss_kb": rss_pages,
             "cpu_ticks": utime + stime,
             "threads": num_threads,
-            "username": username
+            "username": username,
+            "starttime": starttime
         }
     except (FileNotFoundError, PermissionError, IndexError, ValueError):
         return None
@@ -231,6 +241,72 @@ def resolve_dedup(pids, processes, children, claimed):
         out.append(final)
     return out
 
+
+# Interpreters: same binary, different programs -> split by script argument.
+INTERPRETERS = {
+    "python", "python3", "python2", "node", "deno", "bun", "ruby",
+    "perl", "php", "bash", "sh", "zsh", "fish", "dash", "lua", "Rscript",
+    "java", "awk", "gawk",
+}
+
+
+def exe_of(pid):
+    """Kernel-resolved binary path, or None."""
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except Exception:
+        return None
+
+
+def group_key(pid, processes):
+    """App identity: same binary (+script for interpreters) + same user.
+
+    One Firefox/zen binary with 20 --type helpers -> ONE row.
+    Two `python3 a.py` vs `python3 b.py` -> separate rows.
+    """
+    info = processes.get(pid)
+    if not info:
+        return ("?", "", "")
+    exe = exe_of(pid)
+    if exe is None:
+        return ("comm:" + info["name"], "", info["username"])
+    base = exe.rsplit("/", 1)[-1]
+    script = ""
+    if base in INTERPRETERS:
+        parts = (info.get("cmdline") or "").split(" ")
+        for tok in parts[1:]:
+            if tok == "" or tok.startswith("-"):
+                continue
+            script = tok.rsplit("/", 1)[-1]
+            break
+    return (exe, script, info["username"])
+
+
+def group_roots(roots, processes, children):
+    """Merge display-roots of the same app into groups.
+
+    Returns [{key, members(set), kroots:[pids], main:pid}].
+    Groups sorted by total RSS desc.
+    """
+    groups = {}
+    order = []
+    for r in roots:
+        key = group_key(r, processes)
+        if key not in groups:
+            groups[key] = {"key": key, "members": set(), "kroots": []}
+            order.append(key)
+        g = groups[key]
+        g["kroots"].append(r)
+        for m in subtree_members(r, children, processes):
+            g["members"].add(m)
+    ranked = []
+    for key in order:
+        g = groups[key]
+        total = sum(processes[m]["rss_kb"] for m in g["members"] if m in processes)
+        ranked.append((total, key))
+    ranked.sort(reverse=True)
+    return [groups[key] for _, key in ranked]
+
 def child_entry(cpid, processes, children):
     """Detail record for one child: subtree totals + counts."""
     cinfo = processes[cpid]
@@ -259,28 +335,45 @@ def aggregate_processes(processes, children, ppids=None):
 
     claimed = set()
     final_roots = resolve_dedup(roots, processes, children, claimed)
+    groups = group_roots(final_roots, processes, children)
     aggregated = []
 
-    for root_pid in final_roots:
-        root_info = processes[root_pid]
-        members = subtree_members(root_pid, children, processes)
+    for g in groups:
+        members = g["members"]
         claimed |= members
 
-        kids = [c for c in children.get(root_pid, []) if c in processes and c != root_pid]
-        kid_finals = resolve_dedup(kids, processes, children, set())
+        def age_key(p):
+            try:
+                return (int(processes[p].get("starttime") or 0), p)
+            except Exception:
+                return (0, p)
+
+        main_pid = min((m for m in members if m in processes), key=age_key)
+        root_info = processes[main_pid]
+
+        # Merged direct children across all group roots (for expansion)
+        kid_seen = set()
+        kid_pids = []
+        for kr in g["kroots"]:
+            for c in children.get(kr, []):
+                if c in processes and c != kr and c not in kid_seen:
+                    kid_seen.add(c)
+                    kid_pids.append(c)
+        kid_finals = resolve_dedup(kid_pids, processes, children, set())
         child_details = [child_entry(c, processes, children) for c in kid_finals]
         child_details.sort(key=lambda x: x["rss_kb"], reverse=True)
 
         aggregated.append({
-            "pid": root_pid,
+            "pid": main_pid,
             "name": root_info["name"],
             "cmdline": root_info["cmdline"],
-            "rss_kb": sum(processes[m]["rss_kb"] for m in members),
+            "rss_kb": sum(processes[m]["rss_kb"] for m in members if m in processes),
             "own_rss_kb": root_info["rss_kb"],
-            "descendants": len(members) - 1,
-            "total_threads": sum(processes[m].get("threads", 0) for m in members),
+            "descendants": max(0, len(members) - 1),
+            "total_threads": sum(processes[m].get("threads", 0) for m in members if m in processes),
             "username": root_info["username"],
-            "cpu_ticks": sum(processes[m].get("cpu_ticks", 0) for m in members),
+            "cpu_ticks": sum(processes[m].get("cpu_ticks", 0) for m in members if m in processes),
+            "kroots": g["kroots"],
             "top_children": child_details[:8]
         })
 
@@ -313,23 +406,72 @@ def children_of(pid, processes, children, limit=12):
     return result[:limit]
 
 
-def kill_tree(target, signum, processes, children, cap=2000):
-    """Signal a whole process tree. Never touches pid 0/1/2. Returns report."""
-    import signal as sigmod
+def read_identity(pid):
+    """Fresh (comm, starttime) for a pid, or None if unreadable.
+
+    starttime is jiffies since boot: PID-reuse-proof identity together
+    with comm. Read live from /proc at call time (never from cache).
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read().split(")")
+            if len(stat) < 2:
+                return None
+            comm = stat[0].split("(", 1)[1] if "(" in stat[0] else stat[0].strip()
+            fields = stat[1].split()
+            if len(fields) <= 19:
+                return None
+            return {"comm": comm, "starttime": fields[19]}
+    except Exception:
+        return None
+
+
+def tree_pids(target, processes, children, cap=2000):
+    """Identity snapshot [{pid, comm, starttime}] of a tree for later verification."""
     if target <= 2:
-        return {"target": target, "signal": signum, "killed": 0, "failed": [], "refused": True}
-    members = [p for p in subtree_members(target, children, processes) if p > 2]
-    members = members[:cap]
-    # Children first so parents don't get reaped mid-walk (order irrelevant for kill, but tidy)
-    failed = []
+        return []
+    out = []
+    for p in sorted(subtree_members(target, children, processes)):
+        if p <= 2:
+            continue
+        ident = read_identity(p)
+        if ident is None:
+            continue
+        out.append({"pid": p, "comm": ident["comm"], "starttime": ident["starttime"]})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def kill_checked(signum, snapshot):
+    """Signal only pids whose live identity still matches the snapshot.
+
+    Guards against PID reuse between listing and killing. Returns report.
+    """
     killed = 0
-    for p in members:
+    skipped = []
+    failed = []
+    for entry in snapshot:
         try:
-            os.kill(p, signum)
+            pid = int(entry["pid"])
+        except Exception:
+            continue
+        if pid <= 2:
+            skipped.append(pid)
+            continue
+        live = read_identity(pid)
+        if live is None:
+            skipped.append(pid)
+            continue
+        if live["comm"] != entry.get("comm") or str(live["starttime"]) != str(entry.get("starttime")):
+            skipped.append(pid)
+            continue
+        try:
+            os.kill(pid, signum)
             killed += 1
         except Exception:
-            failed.append(p)
-    return {"target": target, "signal": signum, "killed": killed, "failed": failed, "refused": False}
+            failed.append(pid)
+    return {"signal": signum, "killed": killed, "skipped": skipped, "failed": failed}
 
 
 def main():
@@ -344,19 +486,49 @@ def main():
         print(json.dumps(children_of(target, processes, children)))
         return
 
-    # Tree-kill mode: signal a pid and all its descendants (never 0/1/2)
-    if len(sys.argv) > 3 and sys.argv[1] == "killtree":
+    # Snapshot mode: identity list of one or more trees (comma-separated
+    # pids, for merged app groups) for later verified killing
+    if len(sys.argv) > 2 and sys.argv[1] == "tree-pids":
         try:
-            target = int(sys.argv[2])
-            signum = int(sys.argv[3])
+            targets = [int(x) for x in sys.argv[2].split(",") if x.strip() != ""]
         except ValueError:
-            print(json.dumps({"error": "bad-args"}))
+            print("[]")
             return
-        if signum not in (9, 15):
-            print(json.dumps({"error": "bad-signal"}))
+        if not targets:
+            print("[]")
             return
         processes, children, _ppids = build_process_forest()
-        print(json.dumps(kill_tree(target, signum, processes, children)))
+        seen = set()
+        out = []
+        for target in targets:
+            for e in tree_pids(target, processes, children):
+                if e["pid"] not in seen:
+                    seen.add(e["pid"])
+                    out.append(e)
+        # Include each target root itself
+        for target in targets:
+            if target in processes and target > 2 and target not in seen:
+                ident = read_identity(target)
+                if ident is not None:
+                    seen.add(target)
+                    out.append({"pid": target, "comm": ident["comm"],
+                                "starttime": ident["starttime"]})
+        print(json.dumps(out))
+        return
+
+    # Verified-kill mode: signal only pids matching the base64 snapshot
+    if len(sys.argv) > 3 and sys.argv[1] == "killchecked":
+        try:
+            signum = int(sys.argv[2])
+            import base64
+            snapshot = json.loads(base64.b64decode(sys.argv[3]).decode("utf-8"))
+        except Exception:
+            print(json.dumps({"error": "bad-args"}))
+            return
+        if signum not in (9, 15) or not isinstance(snapshot, list):
+            print(json.dumps({"error": "bad-signal"}))
+            return
+        print(json.dumps(kill_checked(signum, snapshot)))
         return
 
     total_mem = get_total_memory()

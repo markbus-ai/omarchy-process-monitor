@@ -23,7 +23,7 @@ Panel {
   property var processes: []
   property string filterText: ""
   property string currentUser: ""
-  property int refreshInterval: 2000
+  property int refreshInterval: 5000
   property int topCount: 15
 
   // Tree state
@@ -40,6 +40,7 @@ Panel {
   property string selectedName: ""
   property string selectedUser: ""
   property int selectedCount: 0
+  property var selectedKroots: []
   property bool showKillConfirm: false
 
   // ── Filtering ──
@@ -97,17 +98,28 @@ Panel {
     if (fetchProc.running || root.fetchQueue.length === 0) return
     var pid = root.fetchQueue.shift()
     root.fetchPid = pid
-    fetchProc.command = ["bash", "-c", "python3 " + root.scriptPath() + " children " + pid]
+    fetchProc.command = ["/usr/bin/python3", root.scriptPath(), "children", String(pid)]
+    root.markProc("fetch")
     fetchProc.running = true
   }
 
+  // Watchdog: our subprocesses always finish in milliseconds (bounded
+  // output); anything running >12s is hung — terminate so we never wedge.
+  property var procStarted: ({})
+  function markProc(name) {
+    var m = Object.assign({}, root.procStarted)
+    m[name] = Date.now()
+    root.procStarted = m
+  }
+
   // ── Kill ──
-  function doKill(pid, name, user, count) {
+  function doKill(pid, name, user, count, kroots) {
     if (pid <= 1) return // never touch init
     root.selectedPid = pid
     root.selectedName = name
     root.selectedUser = user || ""
     root.selectedCount = count || 0
+    root.selectedKroots = (kroots && kroots.length) ? kroots : [pid]
     root.showKillConfirm = true
   }
 
@@ -115,14 +127,30 @@ Panel {
     return root.selectedUser !== "" && root.currentUser !== "" && root.selectedUser !== root.currentUser
   }
 
+  // Two-step kill: snapshot tree identities first, then signal.
+  // Unprivileged path revalidates comm+starttime per pid (PID-reuse safe).
+  // Privileged path execs the system kill binary only, on the fresh list.
+  property string pendingSig: ""
   function execKill(mode) {
     if (root.selectedPid <= 0) return
-    var sig = mode === "kill" ? "9" : "15"
+    root.pendingSig = mode === "kill" ? "9" : "15"
+    var roots = (root.selectedKroots && root.selectedKroots.length) ? root.selectedKroots : [root.selectedPid]
+    treeProc.command = ["/usr/bin/python3", root.scriptPath(), "tree-pids", roots.join(",")]
+    root.markProc("tree")
+    if (!treeProc.running) treeProc.running = true
+  }
+
+  function launchKill(list) {
+    var sig = root.pendingSig || "15"
     var scr = root.scriptPath()
-    if (root.needsRoot())
-      killProc.command = ["pkexec", "python3", scr, "killtree", String(root.selectedPid), sig]
-    else
-      killProc.command = ["python3", scr, "killtree", String(root.selectedPid), sig]
+    if (root.needsRoot()) {
+      var pids = []
+      for (var i = 0; i < list.length; i++) pids.push(String(list[i].pid))
+      killProc.command = ["/usr/bin/pkexec", "/usr/bin/kill", "-" + sig].concat(pids)
+    } else {
+      killProc.command = ["/usr/bin/python3", scr, "killchecked", sig, Qt.btoa(JSON.stringify(list))]
+    }
+    root.markProc("kill")
     killProc.running = true
   }
 
@@ -142,7 +170,11 @@ Panel {
   }
 
   // ── Data ──
-  function refresh() { if (!dataProc.running) dataProc.running = true }
+  function refresh() {
+    if (dataProc.running) return
+    root.markProc("data")
+    dataProc.running = true
+  }
 
   // Absolute path of the bundled helper script, resolved relative to this
   // file so the plugin works for any user (never hardcode $HOME).
@@ -154,7 +186,7 @@ Panel {
 
   Process {
     id: dataProc
-    command: ["bash", "-c", "python3 " + scriptPath() + " " + Math.max(5, Math.min(50, root.topCount))]
+    command: ["/usr/bin/python3", root.scriptPath(), String(Math.max(5, Math.min(50, root.topCount)))]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -179,23 +211,58 @@ Panel {
 
   Process {
     id: fetchProc
-    stdout: StdioCollector { waitForEnd: true }
-    onRunningChanged: {
-      if (running) return
-      var pid = root.fetchPid
-      try {
-        var arr = JSON.parse(String(text || "[]"))
-        var cc = Object.assign({}, root.childCache)
-        cc[pid] = Array.isArray(arr) ? arr : []
-        root.childCache = cc
-      } catch (e) {
-        var cc2 = Object.assign({}, root.childCache)
-        cc2[pid] = []
-        root.childCache = cc2
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var pid = root.fetchPid
+        try {
+          var arr = JSON.parse(String(text || "[]"))
+          var cc = Object.assign({}, root.childCache)
+          cc[pid] = Array.isArray(arr) ? arr : []
+          root.childCache = cc
+        } catch (e) {
+          var cc2 = Object.assign({}, root.childCache)
+          cc2[pid] = []
+          root.childCache = cc2
+        }
+        delete root.fetching[pid]
+        root.fetchPid = -1
+        root.pumpFetch()
       }
-      delete root.fetching[pid]
-      root.fetchPid = -1
-      root.pumpFetch()
+    }
+  }
+
+  Process {
+    id: treeProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var arr = JSON.parse(String(text || "[]"))
+          if (!Array.isArray(arr) || arr.length === 0) {
+            root.showKillConfirm = false
+            root.refresh()
+            return
+          }
+          root.launchKill(arr)
+        } catch (e) {
+          root.showKillConfirm = false
+          root.refresh()
+        }
+      }
+    }
+  }
+
+  Timer {
+    interval: 5000
+    running: true
+    repeat: true
+    onTriggered: {
+      var now = Date.now()
+      if (dataProc.running && now - (root.procStarted.data || 0) > 12000) dataProc.running = false
+      if (fetchProc.running && now - (root.procStarted.fetch || 0) > 12000) { fetchProc.running = false; root.pumpFetch() }
+      if (treeProc.running && now - (root.procStarted.tree || 0) > 12000) { treeProc.running = false; root.showKillConfirm = false }
+      if (killProc.running && now - (root.procStarted.kill || 0) > 12000) { killProc.running = false; root.showKillConfirm = false; root.refresh() }
     }
   }
 
@@ -281,7 +348,7 @@ Panel {
         if (root.selectedIndex >= 0 && root.selectedIndex < f.length) {
           var p = f[root.selectedIndex]
           root.hlPid = p.pid
-          root.doKill(p.pid, U.shortName(p), p.username, p.descendants || 0)
+          root.doKill(p.pid, U.shortName(p), p.username, p.descendants || 0, undefined)
         }
       }
       onCloseRequested: root.close()
@@ -349,12 +416,12 @@ Panel {
                   root.selectedIndex = index
                   root.hlPid = proc.pid
                   if (m.button === Qt.RightButton) {
-                    root.doKill(proc.pid, U.shortName(proc), proc.username || "", proc.descendants || 0)
+                    root.doKill(proc.pid, U.shortName(proc), proc.username || "", proc.descendants || 0, proc.kroots)
                   } else {
                     root.toggleExpand(proc)
                   }
                 }
-                onDoubleClicked: { root.selectedIndex = index; root.hlPid = proc.pid; root.doKill(proc.pid, U.shortName(proc), proc.username || "", proc.descendants || 0) }
+                onDoubleClicked: { root.selectedIndex = index; root.hlPid = proc.pid; root.doKill(proc.pid, U.shortName(proc), proc.username || "", proc.descendants || 0, proc.kroots) }
               }
 
               Rectangle {
@@ -396,7 +463,7 @@ Panel {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.doKill(proc.pid, U.shortName(proc), proc.username || "", proc.descendants || 0)
+                  onClicked: root.doKill(proc.pid, U.shortName(proc), proc.username || "", proc.descendants || 0, proc.kroots)
                 }
               }
               Text {
@@ -460,12 +527,12 @@ Panel {
                     onClicked: function(m) {
                       root.hlPid = kid.pid
                       if (m.button === Qt.RightButton) {
-                        root.doKill(kid.pid, U.shortName(kid), kid.username || "", kid.descendants || 0)
+                        root.doKill(kid.pid, U.shortName(kid), kid.username || "", kid.descendants || 0, undefined)
                       } else {
                         root.toggleExpand(kid)
                       }
                     }
-                    onDoubleClicked: { root.hlPid = kid.pid; root.doKill(kid.pid, U.shortName(kid), kid.username || "", kid.descendants || 0) }
+                    onDoubleClicked: { root.hlPid = kid.pid; root.doKill(kid.pid, U.shortName(kid), kid.username || "", kid.descendants || 0, undefined) }
                   }
 
                   Rectangle { x: 22; y: 3; width: 1; height: 28; color: "#444466" }
@@ -510,7 +577,7 @@ Panel {
                       anchors.fill: parent
                       hoverEnabled: true
                       cursorShape: Qt.PointingHandCursor
-                      onClicked: root.doKill(kid.pid, U.shortName(kid), kid.username || "", kid.descendants || 0)
+                      onClicked: root.doKill(kid.pid, U.shortName(kid), kid.username || "", kid.descendants || 0, undefined)
                     }
                   }
                 }
@@ -530,9 +597,9 @@ Panel {
                       acceptedButtons: Qt.LeftButton | Qt.RightButton
                       onClicked: function(m) {
                         root.hlPid = modelData.pid
-                        if (m.button === Qt.RightButton) root.doKill(modelData.pid, U.shortName(modelData), modelData.username || "", modelData.descendants || 0)
+                        if (m.button === Qt.RightButton) root.doKill(modelData.pid, U.shortName(modelData), modelData.username || "", modelData.descendants || 0, undefined)
                       }
-                      onDoubleClicked: { root.hlPid = modelData.pid; root.doKill(modelData.pid, U.shortName(modelData), modelData.username || "", modelData.descendants || 0) }
+                      onDoubleClicked: { root.hlPid = modelData.pid; root.doKill(modelData.pid, U.shortName(modelData), modelData.username || "", modelData.descendants || 0, undefined) }
                     }
 
                     Rectangle { x: 38; y: 2; width: 1; height: 28; color: "#3a3a55" }
@@ -577,7 +644,7 @@ Panel {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root.doKill(modelData.pid, U.shortName(modelData), modelData.username || "", modelData.descendants || 0)
+                        onClicked: root.doKill(modelData.pid, U.shortName(modelData), modelData.username || "", modelData.descendants || 0, undefined)
                       }
                     }
                   }
