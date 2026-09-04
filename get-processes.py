@@ -14,6 +14,14 @@ import os
 import sys
 import json
 import pwd
+import re
+
+
+def clean_str(s, limit):
+    """Strip control chars and cap length for anything rendered in QML."""
+    if not isinstance(s, str):
+        return ""
+    return re.sub(r"[\x00-\x1f\x7f]", "", s)[:limit]
 
 def get_process_info(pid):
     """Read process info from /proc/[pid]/stat and /proc/[pid]/status."""
@@ -47,11 +55,12 @@ def get_process_info(pid):
         except Exception:
             pass
         
-        # Read cmdline
+        # Read cmdline (byte-capped BEFORE decode; control chars stripped)
         cmdline = ""
         try:
-            with open(f"/proc/{pid}/cmdline", "r") as f:
-                cmdline = f.read().replace("\x00", " ").strip()
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read(8192).replace(b"\x00", b" ").decode("utf-8", "replace")
+            cmdline = re.sub(r"[\x00-\x1f\x7f]", "", raw).strip()[:200]
         except:
             pass
         
@@ -62,11 +71,12 @@ def get_process_info(pid):
             name = name.split("(", 1)[1] if "(" in name else name
         elif name.startswith("("):
             name = name[1:]
-        
+        name = clean_str(name, 64)
+
         # Get username
         try:
             uid = os.stat(f"/proc/{pid}").st_uid
-            username = pwd.getpwuid(uid).pw_name
+            username = clean_str(pwd.getpwuid(uid).pw_name, 32)
         except:
             username = "unknown"
         
@@ -505,6 +515,10 @@ def main():
                 if e["pid"] not in seen:
                     seen.add(e["pid"])
                     out.append(e)
+                if len(out) >= 500:
+                    break
+            if len(out) >= 500:
+                break
         # Include each target root itself
         for target in targets:
             if target in processes and target > 2 and target not in seen:
@@ -528,7 +542,7 @@ def main():
         if signum not in (9, 15) or not isinstance(snapshot, list):
             print(json.dumps({"error": "bad-signal"}))
             return
-        print(json.dumps(kill_checked(signum, snapshot)))
+        print(json.dumps(kill_checked(signum, snapshot[:2000])))
         return
 
     total_mem = get_total_memory()
@@ -538,8 +552,12 @@ def main():
     processes, children, ppids = build_process_forest()
     aggregated = aggregate_processes(processes, children, ppids)
     
-    # Get top N by count
-    top_count = int(sys.argv[1]) if len(sys.argv) > 1 else 15
+    # Get top N by count (clamped: bounded output by design)
+    try:
+        top_count = int(sys.argv[1]) if len(sys.argv) > 1 else 15
+    except ValueError:
+        top_count = 15
+    top_count = max(1, min(top_count, 100))
     top_processes = aggregated[:top_count]
     
     try:

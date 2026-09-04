@@ -57,13 +57,12 @@ omarchy plugin remove markbusking.process-monitor --yes
 
 ## Security notes
 
-- The widget only **reads** `/proc` (own + system-wide RSS, command lines, usernames) to build the tree.
+- The widget only **reads** `/proc` (RSS, command lines, usernames) to build the tree. Reads are byte-capped and control characters are stripped before display.
 - Killing is always user-initiated behind a confirmation dialog showing PID, owner and tree size.
-- Own processes: signaled directly. Other users' processes: `pkexec /usr/bin/kill` (system binary, polkit auth).
-- The privileged path never executes repository code as root — only `/usr/bin/kill` on a freshly listed PID set.
-- Unprivileged kills revalidate each PID's identity (`comm` + starttime) between listing and signaling, so recycled PIDs are skipped, never killed by mistake.
+- Own processes: signaled directly after revalidating each PID's identity (`comm` + starttime), so recycled PIDs are skipped, never killed by mistake.
+- Other users' processes: `pkexec` runs only the system interpreter with an inline, non-writable program that revalidates identity after authorization and immediately before each signal. Repository code is never executed as root.
 - PID 0/1/2 (including `init`) can never be targeted, from UI or script.
-- All subprocesses use absolute binary paths (`/usr/bin/python3`, `/usr/bin/kill`, `/usr/bin/pkexec`) and carry a 12 s watchdog; outputs are size-bounded (top-N rows, capped children).
+- All subprocesses use absolute binary paths (`/usr/bin/python3`, `/usr/bin/kill`, `/usr/bin/pkexec`), carry a 12 s watchdog with teardown cleanup, and produce size-bounded output (clamped top-N, capped children, schema-validated before display).
 
 ## License
 

@@ -43,6 +43,52 @@ Panel {
   property var selectedKroots: []
   property bool showKillConfirm: false
 
+  // ── Ingest validation ──
+  // Nothing from the helper script reaches models or Text items without
+  // shape/type/range checks and hard cardinality caps.
+  function vnum(v, fb) { var n = Number(v); return isFinite(n) ? n : fb }
+  function vstr(v, fb) { return (typeof v === "string") ? v : fb }
+  function cleanProc(p) {
+    if (!p || typeof p !== "object") return null
+    var kids = Array.isArray(p.top_children) ? p.top_children.slice(0, 12) : []
+    var cleanKids = []
+    for (var i = 0; i < kids.length; i++) {
+      var ck = cleanProc(kids[i])
+      if (ck) cleanKids.push(ck)
+    }
+    var kroots = Array.isArray(p.kroots) ? p.kroots.slice(0, 50) : undefined
+    var cleanRoots
+    if (kroots !== undefined) {
+      cleanRoots = []
+      for (var j = 0; j < kroots.length; j++) {
+        var r = Math.floor(vnum(kroots[j], -1))
+        if (r > 0) cleanRoots.push(r)
+      }
+    }
+    return {
+      pid: Math.floor(vnum(p.pid, -1)),
+      name: vstr(p.name, "?").slice(0, 64),
+      cmdline: vstr(p.cmdline, "").slice(0, 200),
+      rss_kb: Math.max(0, vnum(p.rss_kb, 0)),
+      own_rss_kb: Math.max(0, vnum(p.own_rss_kb, 0)),
+      descendants: Math.max(0, Math.floor(vnum(p.descendants, 0))),
+      username: vstr(p.username, "?").slice(0, 32),
+      child_count: Math.max(0, Math.floor(vnum(p.child_count, 0))),
+      top_children: cleanKids,
+      kroots: cleanRoots
+    }
+  }
+  function cleanList(arr, cap) {
+    var out = []
+    if (!Array.isArray(arr)) return out
+    var n = Math.min(arr.length, cap)
+    for (var i = 0; i < n; i++) {
+      var c = cleanProc(arr[i])
+      if (c && c.pid > 0) out.push(c)
+    }
+    return out
+  }
+
   // ── Filtering ──
   function filtered() {
     if (filterText === "") return processes
@@ -114,7 +160,7 @@ Panel {
 
   // ── Kill ──
   function doKill(pid, name, user, count, kroots) {
-    if (pid <= 1) return // never touch init
+    if (pid <= 2) return // never touch init/kthreadd
     root.selectedPid = pid
     root.selectedName = name
     root.selectedUser = user || ""
@@ -140,13 +186,17 @@ Panel {
     if (!treeProc.running) treeProc.running = true
   }
 
+  // Privileged kill runs NO repository code as root: the interpreter is the
+  // system binary and the program is an inline string (no user-writable path
+  // involved). Identity (comm+starttime) is revalidated inside the privileged
+  // execution, after polkit authorization, immediately before each kill.
+  readonly property string killpy: 'import sys, json, os, base64\nsig = int(sys.argv[1])\nitems = json.loads(base64.b64decode(sys.argv[2]).decode())\ndef ident(p):\n    try:\n        f = open("/proc/%d/stat" % p).read().split(")")\n        if len(f) < 2:\n            return None\n        c = f[0].split("(", 1)[1] if "(" in f[0] else ""\n        fl = f[1].split()\n        return (c, fl[19]) if len(fl) > 19 else None\n    except Exception:\n        return None\nk = 0\nsk = []\nfl_ = []\nfor e in items:\n    try:\n        p = int(e["pid"])\n    except Exception:\n        continue\n    if p <= 2:\n        sk.append(p)\n        continue\n    cur = ident(p)\n    if cur is None or cur[0] != e.get("comm") or str(cur[1]) != str(e.get("starttime")):\n        sk.append(p)\n        continue\n    try:\n        os.kill(p, sig)\n        k += 1\n    except Exception:\n        fl_.append(p)\nprint(json.dumps({"killed": k, "skipped": sk, "failed": fl_}))'
+
   function launchKill(list) {
     var sig = root.pendingSig || "15"
     var scr = root.scriptPath()
     if (root.needsRoot()) {
-      var pids = []
-      for (var i = 0; i < list.length; i++) pids.push(String(list[i].pid))
-      killProc.command = ["/usr/bin/pkexec", "/usr/bin/kill", "-" + sig].concat(pids)
+      killProc.command = ["/usr/bin/pkexec", "/usr/bin/python3", "-c", root.killpy, sig, Qt.btoa(JSON.stringify(list))]
     } else {
       killProc.command = ["/usr/bin/python3", scr, "killchecked", sig, Qt.btoa(JSON.stringify(list))]
     }
@@ -192,12 +242,14 @@ Panel {
       onStreamFinished: {
         try {
           var d = JSON.parse(String(text || "{}"))
-          root.usagePercent = d.usage_percent || 0
-          root.totalMemGb = (d.total_mem_kb || 0) / 1048576
-          root.usedMemGb = (d.used_mem_kb || 0) / 1048576
-          root.totalProcesses = d.total_processes || 0
-          root.processes = d.processes || []
-          if (d.current_user) root.currentUser = d.current_user
+          if (!d || typeof d !== "object" || !Array.isArray(d.processes)) return
+          root.usagePercent = Math.max(0, Math.min(100, root.vnum(d.usage_percent, 0)))
+          root.totalMemGb = Math.max(0, root.vnum(d.total_mem_kb, 0)) / 1048576
+          root.usedMemGb = Math.max(0, root.vnum(d.used_mem_kb, 0)) / 1048576
+          root.totalProcesses = Math.max(0, Math.floor(root.vnum(d.total_processes, 0)))
+          root.processes = root.cleanList(d.processes, 60)
+          var cu = root.vstr(d.current_user, "")
+          if (cu !== "") root.currentUser = cu.slice(0, 32)
         } catch (e) {}
       }
     }
@@ -218,7 +270,7 @@ Panel {
         try {
           var arr = JSON.parse(String(text || "[]"))
           var cc = Object.assign({}, root.childCache)
-          cc[pid] = Array.isArray(arr) ? arr : []
+          cc[pid] = root.cleanList(arr, 15)
           root.childCache = cc
         } catch (e) {
           var cc2 = Object.assign({}, root.childCache)
@@ -264,6 +316,14 @@ Panel {
       if (treeProc.running && now - (root.procStarted.tree || 0) > 12000) { treeProc.running = false; root.showKillConfirm = false }
       if (killProc.running && now - (root.procStarted.kill || 0) > 12000) { killProc.running = false; root.showKillConfirm = false; root.refresh() }
     }
+  }
+
+  // Destruction-time cleanup: never leave helper subprocesses behind.
+  Component.onDestruction: {
+    dataProc.running = false
+    fetchProc.running = false
+    treeProc.running = false
+    killProc.running = false
   }
 
   // ── Bar button (icon + % with breathing room; fixed width so the bar never jitters) ──
@@ -445,7 +505,7 @@ Panel {
               }
               Rectangle {
                 id: killBox
-                visible: proc.pid > 1
+                visible: proc.pid > 2
                 anchors.right: parent.right; anchors.rightMargin: 8
                 anchors.verticalCenter: parent.verticalCenter
                 width: 64; height: 22; radius: 5
@@ -489,6 +549,7 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter; anchors.verticalCenterOffset: -8
                 width: 140
                 text: U.shortName(proc)
+                textFormat: Text.PlainText
                 color: "#e0e0e0"
                 font.family: root.bar ? root.bar.fontFamily : "monospace"; font.pixelSize: 11; font.bold: true
                 elide: Text.ElideRight
@@ -498,6 +559,7 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter; anchors.verticalCenterOffset: 9
                 width: 140
                 text: (proc.username || "?") + " · " + proc.pid
+                textFormat: Text.PlainText
                 color: "#888888"
                 font.family: root.bar ? root.bar.fontFamily : "monospace"; font.pixelSize: 9
                 elide: Text.ElideRight
@@ -539,6 +601,7 @@ Panel {
                   Text {
                     x: 42; y: 2; width: 150
                     text: "└ " + U.shortName(kid)
+                    textFormat: Text.PlainText
                     color: "#cccccc"
                     font.family: root.bar ? root.bar.fontFamily : "monospace"; font.pixelSize: 10; font.bold: true
                     elide: Text.ElideRight
@@ -546,6 +609,7 @@ Panel {
                   Text {
                     x: 42; y: 18; width: 150
                     text: "pid " + kid.pid + " · own " + U.fmt(kid.own_rss_kb) + (root.hasKids(kid) ? (kidOpen ? " · ▼" : " · ▶") : "")
+                    textFormat: Text.PlainText
                     color: "#777777"
                     font.family: root.bar ? root.bar.fontFamily : "monospace"; font.pixelSize: 8
                     elide: Text.ElideRight
@@ -560,7 +624,7 @@ Panel {
                   }
                   Rectangle {
                     id: kidKill
-                    visible: kid.pid > 1
+                    visible: kid.pid > 2
                     anchors.right: parent.right; anchors.rightMargin: 8
                     anchors.top: parent.top; anchors.topMargin: 7
                     width: 40; height: 20; radius: 4
@@ -606,6 +670,7 @@ Panel {
                     Text {
                       x: 50; y: 1; width: 140
                       text: "└ " + U.shortName(modelData)
+                      textFormat: Text.PlainText
                       color: "#bbbbbb"
                       font.family: root.bar ? root.bar.fontFamily : "monospace"; font.pixelSize: 9; font.bold: true
                       elide: Text.ElideRight
@@ -613,6 +678,7 @@ Panel {
                     Text {
                       x: 50; y: 16; width: 140
                       text: "pid " + modelData.pid + ((modelData.child_count || 0) > 0 ? " · +" + modelData.child_count + " more" : "")
+                      textFormat: Text.PlainText
                       color: "#666666"
                       font.family: root.bar ? root.bar.fontFamily : "monospace"; font.pixelSize: 8
                       elide: Text.ElideRight
@@ -627,7 +693,7 @@ Panel {
                     }
                     Rectangle {
                       id: gKill
-                      visible: modelData.pid > 1
+                      visible: modelData.pid > 2
                       anchors.right: parent.right; anchors.rightMargin: 8
                       anchors.top: parent.top; anchors.topMargin: 6
                       width: 34; height: 18; radius: 4

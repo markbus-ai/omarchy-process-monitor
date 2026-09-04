@@ -37,6 +37,7 @@ Rectangle {
     Text {
       x: 0; y: 36; width: 280
       text: "PID " + dlg.pid + (dlg.procUser !== "" ? " · " + dlg.procUser : "") + (dlg.procCount > 0 ? " · " + (dlg.procCount + 1) + " procs" : "")
+      textFormat: Text.PlainText
       color: "#888888"
       font.family: dlg.barFont(); font.pixelSize: 10
       horizontalAlignment: Text.AlignHCenter
