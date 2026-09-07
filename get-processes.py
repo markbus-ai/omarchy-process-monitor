@@ -26,9 +26,9 @@ def clean_str(s, limit):
 def get_process_info(pid):
     """Read process info from /proc/[pid]/stat and /proc/[pid]/status."""
     try:
-        # Read stat file for CPU info
+        # Read stat file for CPU info (byte-capped: single ABI line)
         with open(f"/proc/{pid}/stat", "r") as f:
-            stat = f.read().split(")")
+            stat = f.read(2048).split(")")
             if len(stat) < 2:
                 return None
             fields = stat[1].split()
@@ -40,7 +40,8 @@ def get_process_info(pid):
         rss_pages = 0
         num_threads = 1
         with open(f"/proc/{pid}/status", "r") as f:
-            for line in f:
+            content = f.read(8192)
+            for line in content.splitlines():
                 if line.startswith("VmRSS:"):
                     rss_pages = int(line.split()[1])  # in kB
                 elif line.startswith("Threads:"):
@@ -102,7 +103,7 @@ def get_ppid(pid):
     """
     try:
         with open(f"/proc/{pid}/stat", "r") as f:
-            stat = f.read().split(")")
+            stat = f.read(2048).split(")")
             if len(stat) < 2:
                 return 1
             fields = stat[1].split()
@@ -122,8 +123,9 @@ def build_process_forest():
     children = {}  # ppid -> [pids]
     ppids = {}  # pid -> ppid
 
-    # Collect all PIDs
-    for entry in os.listdir("/proc"):
+    # Collect all PIDs (cardinality-capped: desktops see hundreds;
+    # the cap only bounds pathological fork-pressure, never normal use)
+    for entry in os.listdir("/proc")[:8192]:
         try:
             pid = int(entry)
             if pid <= 0:
@@ -485,6 +487,14 @@ def kill_checked(signum, snapshot):
 
 
 def main():
+    # Self-terminate: this script must never hang longer than 10s, no matter
+    # what /proc looks like (complements the QML-side watchdog).
+    try:
+        import signal
+        signal.alarm(10)
+    except Exception:
+        pass
+
     # Lazy mode: children of a single pid (for expanding tree nodes)
     if len(sys.argv) > 2 and sys.argv[1] == "children":
         try:

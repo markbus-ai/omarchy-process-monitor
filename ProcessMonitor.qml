@@ -158,7 +158,7 @@ Panel {
     root.procStarted = m
   }
 
-  // ── Kill ──
+  // ── Kill (own processes only; foreign PIDs fail closed) ──
   function doKill(pid, name, user, count, kroots) {
     if (pid <= 2) return // never touch init/kthreadd
     root.selectedPid = pid
@@ -166,16 +166,12 @@ Panel {
     root.selectedUser = user || ""
     root.selectedCount = count || 0
     root.selectedKroots = (kroots && kroots.length) ? kroots : [pid]
+    root.killError = ""
     root.showKillConfirm = true
   }
 
-  function needsRoot() {
-    return root.selectedUser !== "" && root.currentUser !== "" && root.selectedUser !== root.currentUser
-  }
-
-  // Two-step kill: snapshot tree identities first, then signal.
-  // Unprivileged path revalidates comm+starttime per pid (PID-reuse safe).
-  // Privileged path execs the system kill binary only, on the fresh list.
+  // Two-step kill: snapshot tree identities first, then signal only the
+  // PIDs whose comm+starttime still match (PID-reuse safe).
   property string pendingSig: ""
   function execKill(mode) {
     if (root.selectedPid <= 0) return
@@ -186,20 +182,13 @@ Panel {
     if (!treeProc.running) treeProc.running = true
   }
 
-  // Privileged kill runs NO repository code as root: the interpreter is the
-  // system binary and the program is an inline string (no user-writable path
-  // involved). Identity (comm+starttime) is revalidated inside the privileged
-  // execution, after polkit authorization, immediately before each kill.
-  readonly property string killpy: 'import sys, json, os, base64\nsig = int(sys.argv[1])\nitems = json.loads(base64.b64decode(sys.argv[2]).decode())\ndef ident(p):\n    try:\n        f = open("/proc/%d/stat" % p).read().split(")")\n        if len(f) < 2:\n            return None\n        c = f[0].split("(", 1)[1] if "(" in f[0] else ""\n        fl = f[1].split()\n        return (c, fl[19]) if len(fl) > 19 else None\n    except Exception:\n        return None\nk = 0\nsk = []\nfl_ = []\nfor e in items:\n    try:\n        p = int(e["pid"])\n    except Exception:\n        continue\n    if p <= 2:\n        sk.append(p)\n        continue\n    cur = ident(p)\n    if cur is None or cur[0] != e.get("comm") or str(cur[1]) != str(e.get("starttime")):\n        sk.append(p)\n        continue\n    try:\n        os.kill(p, sig)\n        k += 1\n    except Exception:\n        fl_.append(p)\nprint(json.dumps({"killed": k, "skipped": sk, "failed": fl_}))'
-
+  // Only the user's OWN processes can be signaled (verified killchecked
+  // helper, no privilege boundary anywhere in this plugin).
+  property string killError: ""
   function launchKill(list) {
     var sig = root.pendingSig || "15"
     var scr = root.scriptPath()
-    if (root.needsRoot()) {
-      killProc.command = ["/usr/bin/pkexec", "/usr/bin/python3", "-c", root.killpy, sig, Qt.btoa(JSON.stringify(list))]
-    } else {
-      killProc.command = ["/usr/bin/python3", scr, "killchecked", sig, Qt.btoa(JSON.stringify(list))]
-    }
+    killProc.command = ["/usr/bin/python3", scr, "killchecked", sig, Qt.btoa(JSON.stringify(list))]
     root.markProc("kill")
     killProc.running = true
   }
@@ -257,8 +246,25 @@ Panel {
 
   Process {
     id: killProc
-    stdout: StdioCollector { waitForEnd: true }
-    onRunningChanged: { if (!running) { root.showKillConfirm = false; root.refresh() } }
+    property string outText: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: killProc.outText = String(text || "")
+    }
+    onRunningChanged: {
+      if (running) return
+      var ok = false
+      try {
+        ok = (JSON.parse(killProc.outText || "{}").killed || 0) > 0
+      } catch (e) {}
+      if (ok) {
+        root.killError = ""
+        root.showKillConfirm = false
+      } else {
+        root.killError = "Nada para matar (¿otro usuario o ya terminó?)"
+      }
+      root.refresh()
+    }
   }
 
   Process {
@@ -750,7 +756,7 @@ Panel {
       procName: root.selectedName
       procUser: root.selectedUser
       procCount: root.selectedCount
-      needsRoot: root.needsRoot()
+      errText: root.killError
       bar: root.bar
       onUseTerm: root.execKill("term")
       onUseKill: root.execKill("kill")

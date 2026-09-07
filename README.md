@@ -12,8 +12,8 @@ An Omarchy Quattro bar widget that shows **real** per-process-tree RAM usage —
 - Click any row to expand its children, recursively (grandchildren load on demand)
 - Per-process kill buttons with SIGTERM / SIGKILL confirmation
 - Tree-kill: killing a row signals the whole subtree, not just the parent
-- Processes owned by other users (e.g. root) kill via `pkexec` + polkit
-- `init` (PID 1) can never be killed from here
+- Only your own processes can be signaled; other users' processes fail closed with a notice
+- `init` and kernel threads (PID 0/1/2) can never be targeted
 - Live text filter, keyboard navigation (`j/k`, `Enter`, `Space`, `Esc`)
 - Refreshes every 2 seconds (configurable)
 
@@ -21,7 +21,6 @@ An Omarchy Quattro bar widget that shows **real** per-process-tree RAM usage —
 
 - Omarchy Quattro (Quickshell shell)
 - `python3` (standard library only, no dependencies)
-- `pkexec` + a polkit agent (optional — only needed to kill other users' processes)
 
 ## Install
 
@@ -57,12 +56,12 @@ omarchy plugin remove markbusking.process-monitor --yes
 
 ## Security notes
 
-- The widget only **reads** `/proc` (RSS, command lines, usernames) to build the tree. Reads are byte-capped and control characters are stripped before display.
+- The widget only **reads** `/proc` (RSS, command lines, usernames) to build the tree. Reads are byte-capped, the PID scan is cardinality-capped, and control characters are stripped before display.
 - Killing is always user-initiated behind a confirmation dialog showing PID, owner and tree size.
-- Own processes: signaled directly after revalidating each PID's identity (`comm` + starttime), so recycled PIDs are skipped, never killed by mistake.
-- Other users' processes: `pkexec` runs only the system interpreter with an inline, non-writable program that revalidates identity after authorization and immediately before each signal. Repository code is never executed as root.
+- Each PID can only be signaled if owned by you, and identity (`comm` + starttime) is revalidated between listing and signaling, so recycled PIDs are skipped, never killed by mistake.
+- There is **no privilege boundary** anywhere: no `sudo`, `pkexec`, setuid or capabilities. Only your own processes can be signaled; anything else fails closed with a notice.
 - PID 0/1/2 (including `init`) can never be targeted, from UI or script.
-- All subprocesses use absolute binary paths (`/usr/bin/python3`, `/usr/bin/kill`, `/usr/bin/pkexec`), carry a 12 s watchdog with teardown cleanup, and produce size-bounded output (clamped top-N, capped children, schema-validated before display).
+- All subprocesses use absolute binary paths (`/usr/bin/python3`, `/usr/bin/kill`), self-terminate via alarm plus a 12 s watchdog with teardown cleanup, and produce size-bounded output (clamped top-N, capped children, schema-validated before display).
 
 ## License
 

@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "markbusking.process-monitor",
   "name": "Process Monitor",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "markbusking",
-  "description": "RAM usage monitor with recursive per-process tree explorer and process killer (pkexec for root)",
+  "description": "RAM usage monitor with true per-process-tree totals, recursive explorer and verified tree-kill",
   "kinds": [
     "bar-widget"
   ],
